@@ -6,6 +6,7 @@ from airflow.operators.python import PythonOperator, get_current_context
 from datetime import datetime, timedelta
 import pandas as pd
 import requests
+import pendulum
 
 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 from google.cloud import bigquery
@@ -97,8 +98,8 @@ with DAG(
     dag_id="openfda_to_bigquery_weekly",
     description="Fetch OpenFDA ibuprofen events and load weekly sums to BigQuery",
     schedule="@monthly",
-    start_date=datetime(2020, 11, 1),
-    catchup=False,             # True se quiser backfill
+    start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),
+    catchup=True,             # True se quiser backfill
     max_active_tasks=1,
     default_args=default_args,
     tags=["openfda", "bigquery"],
@@ -106,6 +107,7 @@ with DAG(
     fetch = PythonOperator(task_id="fetch_openfda_data", python_callable=fetch_openfda_data)
     load  = PythonOperator(task_id="save_to_bigquery",   python_callable=save_to_bigquery)
     fetch >> load
+
 
 
 
