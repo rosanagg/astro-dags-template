@@ -1,118 +1,78 @@
-# dags/bitcoin_etl_coingecko_to_gbq.py
 from __future__ import annotations
-
 from airflow.decorators import dag, task
-from airflow.operators.python import get_current_context
-from datetime import timedelta
-import pendulum
-import requests
-import pandas as pd
-
-# We'll use the hook only to fetch application credentials from your Airflow GCP connection
 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+import pendulum
+import pandas as pd
+import requests
+from datetime import date
 
-# ====== CONFIG ======
-GCP_PROJECT  = "disciplinacd-470814"      # e.g., "my-gcp-project"
-BQ_DATASET   = "crypto"                    # e.g., "crypto"
-BQ_TABLE     = "bitcoin_history_hourly"    # e.g., "bitcoin_history_hourly"
-BQ_LOCATION  = "US"                        # dataset location: "US" or "EU"
-GCP_CONN_ID  = "google_cloud_default"      # Airflow connection with a SA that can write to BQ
-# ====================
+# Configurações
+GCP_PROJECT  = "disciplinacd-470814"
+BQ_DATASET   = "dataset_fda"
+BQ_TABLE     = "openfda_sildenafil_range_test"
+BQ_LOCATION  = "US"
+GCP_CONN_ID  = "google_cloud_default"
+USE_POOL     = True
+POOL_NAME    = "openfda_api"
+TEST_START = date(2025, 6, 1)
+TEST_END   = date(2025, 7, 29)
+DRUG_QUERY = 'ibuprofen'
 
-DEFAULT_ARGS = {
-    "email_on_failure": True,
-    "owner": "Alex Lopes,Open in Cloud IDE",
-}
+SESSION = requests.Session()
+SESSION.headers.update({"rosana": "mda-openfda-etl/1.0 (contato: rosanagg@gmail.com.br)"})
 
-@task
-def fetch_and_to_gbq():
-    """
-    Fetch hourly BTC data for the 'yesterday' window using CoinGecko and load it to BigQuery
-    via pandas.DataFrame.to_gbq()
-    """
-    ctx = get_current_context()
-
-    # "Yesterday" window: [data_interval_start - 1 day, data_interval_start)
-    end_time = ctx["data_interval_start"]
-    start_time = end_time - timedelta(days=1)
-    print(f"[UTC] target window: {start_time} -> {end_time}")
-
-    start_s = int(start_time.timestamp())   # CoinGecko expects seconds
-    end_s   = int(end_time.timestamp())
-
-    url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart/range"
-    params = {"vs_currency": "usd", "from": start_s, "to": end_s}
-
-    r = requests.get(url, params=params, timeout=30)
+def _openfda_get(url: str) -> dict:
+    r = SESSION.get(url, timeout=30)
+    if r.status_code == 404:
+        return {"results": []}
     r.raise_for_status()
-    payload = r.json()
+    return r.json()
 
-    prices = payload.get("prices", [])
-    caps   = payload.get("market_caps", [])
-    vols   = payload.get("total_volumes", [])
+def _build_openfda_url(start: date, end: date, drug_query: str) -> str:
+    start_str = start.strftime("%Y%m%d")
+    end_str   = end.strftime("%Y%m%d")
+    return ("https://api.fda.gov/drug/event.json"
+            f"?search=patient.drug.medicinalproduct:%22{drug_query}%22"
+            f"+AND+receivedate:[{start_str}+TO+{end_str}]"
+            "&count=receivedate")
 
-    if not prices:
-        print("No data returned for the specified window.")
+_task_kwargs = dict(retries=0)
+if USE_POOL:
+    _task_kwargs["pool"] = POOL_NAME
+
+@task(**_task_kwargs)
+def fetch_fixed_range_and_to_bq():
+    url = _build_openfda_url(TEST_START, TEST_END, DRUG_QUERY)
+    data = _openfda_get(url)
+    results = data.get("results", [])
+    if not results:
         return
-
-    # Build a tidy DataFrame: time (UTC), price_usd, market_cap_usd, volume_usd
-    df_p = pd.DataFrame(prices, columns=["time_ms", "price_usd"])
-    df_c = pd.DataFrame(caps,   columns=["time_ms", "market_cap_usd"])
-    df_v = pd.DataFrame(vols,   columns=["time_ms", "volume_usd"])
-
-    df = df_p.merge(df_c, on="time_ms", how="outer").merge(df_v, on="time_ms", how="outer")
-    df["time"] = pd.to_datetime(df["time_ms"], unit="ms", utc=True)
-    df.drop(columns=["time_ms"], inplace=True)
-    df.sort_values("time", inplace=True)
-
-    # Preview in logs
-    print(df.head(10).to_string())
-
-    # -------- Load to BigQuery using pandas-gbq --------
-    # Get auth credentials from Airflow connection (recommended in Airflow)
+    df = pd.DataFrame(results).rename(columns={"count": "events"})
+    df["time"] = pd.to_datetime(df["time"], format="%Y%m%d", utc=True)
+    df["win_start"] = pd.to_datetime(TEST_START)
+    df["win_end"]   = pd.to_datetime(TEST_END)
+    df["drug"]      = DRUG_QUERY.replace("+", " ")
     bq_hook = BigQueryHook(gcp_conn_id=GCP_CONN_ID, location=BQ_LOCATION, use_legacy_sql=False)
-    credentials = bq_hook.get_credentials()
-    print(f"cred: {credentials}")
-    destination_table = f"{BQ_DATASET}.{BQ_TABLE}"
+    df.to_gbq(destination_table=f"{BQ_DATASET}.{BQ_TABLE}",
+              project_id=GCP_PROJECT,
+              if_exists="append",
+              credentials=bq_hook.get_credentials(),
+              table_schema=[
+                {"name": "time", "type": "TIMESTAMP"},
+                {"name": "events", "type": "INTEGER"},
+                {"name": "win_start", "type": "DATE"},
+                {"name": "win_end", "type": "DATE"},
+                {"name": "drug", "type": "STRING"}],
+              location=BQ_LOCATION,
+              progress_bar=False)
 
-    # Optional explicit schema (helps first-time table creation)
-    table_schema = [
-        {"name": "time",            "type": "TIMESTAMP"},
-        {"name": "price_usd",       "type": "FLOAT"},
-        {"name": "market_cap_usd",  "type": "FLOAT"},
-        {"name": "volume_usd",      "type": "FLOAT"},
-    ]
+@dag(dag_id="openfda_mcb2_test_range",
+     schedule="@once",
+     start_date=pendulum.datetime(2025, 9, 23, tz="UTC"),
+     catchup=False,
+     max_active_runs=1,
+     tags=["openfda", "bigquery", "test", "range"])
+def openfda_pipeline_test_range():
+    fetch_fixed_range_and_to_bq()
 
-    # Ensure 'time' is a column (not index)
-    if df.index.name == "time":
-        df = df.reset_index()
-
-    # pandas-gbq: append rows; if table doesn't exist, it's created with schema
-    # Note: Set 'location' to match your dataset region
-    df.to_gbq(
-        destination_table=destination_table,
-        project_id=GCP_PROJECT,
-        if_exists="append",          # or "replace" / "fail"
-        credentials=credentials,
-        table_schema=table_schema,   # used on first create
-        location=BQ_LOCATION,
-        progress_bar=False,
-    )
-
-    print(f"Loaded {len(df)} rows to {GCP_PROJECT}.{destination_table} (location={BQ_LOCATION}).")
-
-@dag(
-    default_args=DEFAULT_ARGS,
-    schedule="0 0 * * *",  # daily at 00:00 UTC
-    start_date=pendulum.datetime(2025, 9, 17, tz="UTC"),
-    catchup=True,
-    owner_links={
-        "Alex Lopes": "mailto:alexlopespereira@gmail.com",
-        "Open in Cloud IDE": "https://cloud.astronomer.io/cm3webulw15k701npm2uhu77t/cloud-ide/cm42rbvn10lqk01nlco70l0b8/cm44gkosq0tof01mxajutk86g",
-    },
-    tags=["bitcoin", "etl", "coingecko", "bigquery", "pandas-gbq"],
-)
-def bitcoin_etl_bigquery():
-    fetch_and_to_gbq()
-
-dag = bitcoin_etl_bigquery()
+dag = openfda_pipeline_test_range()
