@@ -128,7 +128,7 @@ with DAG(
     dag_id="openfda_to_bigquery_weekly",
     description="Fetch OpenFDA ibuprofen events and load weekly sums to BigQuery",
     schedule="@monthly",
-    start_date=datetime(2025, 09, 1),
+    start_date=datetime(2025, 9, 1),
     catchup=True,               # True se quiser backfill
     max_active_tasks=1,
     default_args=default_args,
@@ -139,6 +139,7 @@ with DAG(
     load  = PythonOperator(task_id="save_to_bigquery",   python_callable=save_to_bigquery)
 
     fetch >> check >> load
+
 
 
 
