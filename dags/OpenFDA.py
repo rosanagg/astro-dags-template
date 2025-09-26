@@ -11,11 +11,19 @@ from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 from google.cloud import bigquery
 
 # ====== CONFIG ======
-GCP_PROJECT = "disciplinacd-470814"     # <--- troque se necessário
-BQ_DATASET  = "openfda"                 # será criado fora da DAG (ou crie manualmente)
-BQ_TABLE    = "events_weekly"           # destino final
-GCP_CONN_ID = "google_cloud_default"    # conexão do Airflow
+GCP_PROJECT = "disciplinacd-470814"
+BQ_DATASET  = "openfda"
+BQ_TABLE    = "events_weekly"
+GCP_CONN_ID = "google_cloud_default"
 # ====================
+
+# defaults da DAG (opcional, mas recomendado)
+default_args = {
+    "owner": "airflow",
+    "depends_on_past": False,
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
+}
 
 def generate_query_url(year: int, month: int) -> str:
     start_date = f"{year}{month:02d}01"
@@ -29,28 +37,31 @@ def generate_query_url(year: int, month: int) -> str:
 
 def fetch_openfda_data():
     ctx = get_current_context()
-    execution_date = ctx["dag_run"].execution_date
-    year, month = execution_date.year, execution_date.month
+
+    # Airflow 2.x: use data_interval_start (ou logical_date)
+    start = ctx["data_interval_start"]
+    year, month = start.year, start.month
 
     url = generate_query_url(year, month)
     r = requests.get(url, timeout=60)
+    r.raise_for_status()
 
-    if r.status_code == 200:
-        data = r.json()
-        df = pd.DataFrame(data.get("results", []))
-        if not df.empty:
-            df["time"] = pd.to_datetime(df["time"])
-            weekly = (
-                df.groupby(pd.Grouper(key="time", freq="W"))["count"]
-                  .sum()
-                  .reset_index()
-                  .rename(columns={"time": "week_start", "count": "events"})
-            )
-            weekly["week_start"] = weekly["week_start"].dt.date.astype(str)
-        else:
-            weekly = pd.DataFrame(columns=["week_start", "events"])
-    else:
-        weekly = pd.DataFrame(columns=["week_start", "events"])
+    data = r.json()
+    df = pd.DataFrame(data.get("results", []))
+
+    if df.empty:
+        ctx["ti"].xcom_push(key="openfda_weekly", value={"week_start": [], "events": []})
+        return
+
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+
+    weekly = (
+        df.groupby(pd.Grouper(key="time", freq="W"))["count"]
+          .sum()
+          .reset_index()
+          .rename(columns={"time": "week_start", "count": "events"})
+    )
+    weekly["week_start"] = weekly["week_start"].dt.date  # BQ espera DATE
 
     ctx["ti"].xcom_push(key="openfda_weekly", value=weekly.to_dict(orient="list"))
 
@@ -61,6 +72,12 @@ def save_to_bigquery():
         return
 
     df = pd.DataFrame.from_dict(data_dict)
+    if df.empty:
+        return
+
+    # Tipagem compatível com schema
+    df["week_start"] = pd.to_datetime(df["week_start"]).dt.date
+    df["events"] = pd.to_numeric(df["events"]).fillna(0).astype("Int64")
 
     hook = BigQueryHook(gcp_conn_id=GCP_CONN_ID, use_legacy_sql=False)
     client: bigquery.Client = hook.get_client(project_id=GCP_PROJECT)
@@ -73,38 +90,23 @@ def save_to_bigquery():
             bigquery.SchemaField("events", "INTEGER"),
         ],
     )
-    # Converte tipos para garantir compatibilidade
-    if not df.empty:
-        df = df.astype({"week_start": "string", "events": "Int64"}).fillna({"events": 0})
     load_job = client.load_table_from_dataframe(df, table_id, job_config=job_config)
-    load_job.result()  # espera terminar
-
-default_args = {
-    "owner": "airflow",
-    "depends_on_past": False,
-    "retries": 1,
-    "retry_delay": timedelta(minutes=5),
-}
+    load_job.result()
 
 with DAG(
     dag_id="openfda_to_bigquery_weekly",
     description="Fetch OpenFDA ibuprofen events and load weekly sums to BigQuery",
-    schedule="@monthly",               # rode mensalmente; mude se quiser
+    schedule="@monthly",
     start_date=datetime(2020, 11, 1),
-    catchup=False,                     # mude para True se quiser backfill
+    catchup=False,             # True se quiser backfill
     max_active_tasks=1,
     default_args=default_args,
     tags=["openfda", "bigquery"],
 ) as dag:
-    fetch = PythonOperator(
-        task_id="fetch_openfda_data",
-        python_callable=fetch_openfda_data,
-    )
-    load = PythonOperator(
-        task_id="save_to_bigquery",
-        python_callable=save_to_bigquery,
-    )
+    fetch = PythonOperator(task_id="fetch_openfda_data", python_callable=fetch_openfda_data)
+    load  = PythonOperator(task_id="save_to_bigquery",   python_callable=save_to_bigquery)
     fetch >> load
+
 
 
 
